@@ -1,0 +1,4 @@
+# Development / test dependencies. Streamlit Community Cloud only reads
+# requirements.txt, so pytest is kept out of the deployed image.
+-r requirements.txt
+pytest>=7.4,<10

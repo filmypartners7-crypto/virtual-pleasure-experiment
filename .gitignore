@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+*.log
+build/
+dist/
+
+# Never commit local secrets (Streamlit Cloud uses its own secrets manager).
+.streamlit/secrets.toml
