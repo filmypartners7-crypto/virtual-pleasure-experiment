@@ -1,137 +1,197 @@
-"""Protocol representation for the Virtual Pleasure Experiment.
+"""Protocols: an ordered list of steps.
 
-A protocol is a small set of structured variables the experimenter sets with
-sliders. The optional free-text guide is stored for reference only: it is never
-parsed, summarised or interpreted by the application. The experimenter is the
-one who decides which slider value corresponds to which part of their guide.
+A protocol is now a *sequence*, not seven sliders. That is what makes ordering,
+ablation and substitution experiments possible: you can disable a step, move it,
+or swap a technique, and re-run against the same women.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import Any, Iterable, Sequence
 
 import pandas as pd
 
-PROTOCOL_VARIABLES: list[str] = [
-    "consistency",
-    "feedback_responsiveness",
-    "adaptation",
-    "communication",
-    "comfort_checks",
-    "boundary_respect",
-    "adherence",
-]
+from .techniques import TECHNIQUE_INDEX, get as get_technique
 
-PROTOCOL_VARIABLE_INFO: dict[str, dict[str, str]] = {
-    "consistency": {
-        "label": "Consistency of the approach",
-        "help": (
-            "How reliably the approach is applied across the encounter. Enters as "
-            "effective consistency, which is discounted by the profile's adherence variability."
-        ),
-    },
-    "feedback_responsiveness": {
-        "label": "Responsiveness to partner feedback",
-        "help": (
-            "How far the approach changes in response to cues from the partner. Averaged with "
-            "the male profile's feedback responsiveness to form the feedback loop."
-        ),
-    },
-    "adaptation": {
-        "label": "Adaptation to individual preferences",
-        "help": (
-            "How far the approach is tailored to this person. Drives the preference-match term, "
-            "which is stronger for profiles with specific preferences."
-        ),
-    },
-    "communication": {
-        "label": "Communication",
-        "help": (
-            "How much explicit verbal communication the approach builds in. Combined with the "
-            "feedback loop to form effective communication."
-        ),
-    },
-    "comfort_checks": {
-        "label": "Comfort checks",
-        "help": (
-            "How often the approach pauses to check comfort. Raises comfort and lowers "
-            "discomfort risk."
-        ),
-    },
-    "boundary_respect": {
-        "label": "Respect for pauses and boundaries",
-        "help": (
-            "How strictly the approach honours pauses, refusals and limits. The strongest "
-            "single term in the comfort equation."
-        ),
-    },
-    "adherence": {
-        "label": "Protocol adherence",
-        "help": (
-            "How closely the declared approach is actually followed. Discounted by the male "
-            "profile's adherence variability before it enters any equation."
-        ),
-    },
-}
+MAX_STEP_MINUTES = 15.0
 
 
-def _check_unit_interval(name: str, value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"protocol variable '{name}' must be a number between 0 and 1")
-    value = float(value)
-    if not (0.0 <= value <= 1.0):
-        raise ValueError(f"protocol variable '{name}' must lie in [0, 1], got {value}")
-    return value
+@dataclass(frozen=True)
+class Step:
+    """One step of a protocol: a technique, for a duration, at an intensity."""
+
+    technique_key: str
+    duration_min: float = 2.0
+    intensity: float | None = None      # None -> the technique's default intensity
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        if self.technique_key not in TECHNIQUE_INDEX:
+            raise ValueError(f"unknown technique: {self.technique_key}")
+        if not isinstance(self.duration_min, (int, float)) or isinstance(self.duration_min, bool):
+            raise ValueError("step duration must be a number of minutes")
+        if not (1.0 / 60.0 <= float(self.duration_min) <= MAX_STEP_MINUTES):
+            raise ValueError(
+                f"step duration must lie between 1 second and {MAX_STEP_MINUTES} minutes"
+            )
+        if self.intensity is not None:
+            if not isinstance(self.intensity, (int, float)) or isinstance(self.intensity, bool):
+                raise ValueError("step intensity must be a number or None")
+            if not (0.0 <= float(self.intensity) <= 1.0):
+                raise ValueError("step intensity must lie in [0, 1]")
+
+    @property
+    def technique(self):
+        return get_technique(self.technique_key)
+
+    def resolved_intensity(self) -> float:
+        if self.technique.verbal:
+            return 0.0
+        return float(self.technique.intensity if self.intensity is None else self.intensity)
+
+    def as_row(self, index: int) -> dict[str, Any]:
+        return {
+            "step": index,
+            "technique_key": self.technique_key,
+            "technique": self.technique.label,
+            "minutes": round(float(self.duration_min), 2),
+            "intensity": round(self.resolved_intensity(), 2),
+            "note": self.note,
+        }
 
 
 @dataclass(frozen=True)
 class Protocol:
-    """A structured experimental protocol, all variables on a 0-1 scale."""
-
-    consistency: float = 0.50
-    feedback_responsiveness: float = 0.50
-    adaptation: float = 0.50
-    communication: float = 0.50
-    comfort_checks: float = 0.50
-    boundary_respect: float = 0.50
-    adherence: float = 0.50
-    label: str = "user_configured"
-    guide_reference_text: str = ""
+    name: str
+    steps: tuple[Step, ...]
 
     def __post_init__(self) -> None:
-        for name in PROTOCOL_VARIABLES:
-            object.__setattr__(self, name, _check_unit_interval(name, getattr(self, name)))
-        if not isinstance(self.label, str):
-            raise ValueError("protocol label must be a string")
-        if not isinstance(self.guide_reference_text, str):
-            raise ValueError("guide reference text must be a string")
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("protocol name must be a non-empty string")
+        if not self.steps:
+            raise ValueError("a protocol must contain at least one step")
+        if not all(isinstance(step, Step) for step in self.steps):
+            raise ValueError("protocol steps must be Step instances")
 
-    def values(self) -> dict[str, float]:
-        return {name: float(getattr(self, name)) for name in PROTOCOL_VARIABLES}
+    # -- properties ------------------------------------------------------ #
 
-    def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        data["guide_reference_text"] = self.guide_reference_text
-        data["guide_reference_note"] = (
-            "Reference text supplied by the experimenter. It is NOT parsed or interpreted by "
-            "the application; the experimenter maps the guide to the structured variables."
-        )
-        return data
+    @property
+    def duration_min(self) -> float:
+        return float(sum(step.duration_min for step in self.steps))
+
+    @property
+    def verbal_minutes(self) -> float:
+        return float(sum(step.duration_min for step in self.steps if step.technique.verbal))
+
+    @property
+    def check_in_fraction(self) -> float:
+        return self.verbal_minutes / self.duration_min if self.duration_min else 0.0
+
+    @property
+    def max_directness(self) -> float:
+        return max((step.technique.directness for step in self.steps), default=0.0)
+
+    def signature(self) -> str:
+        return ">".join(step.technique_key for step in self.steps)
 
     def as_frame(self) -> pd.DataFrame:
-        rows = []
-        for name in PROTOCOL_VARIABLES:
-            info = PROTOCOL_VARIABLE_INFO[name]
-            rows.append(
+        return pd.DataFrame([step.as_row(i) for i, step in enumerate(self.steps, start=1)])
+
+    # -- transformations used by the experiment engine ------------------- #
+
+    def with_step_disabled(self, index: int, name_suffix: str = " (step removed)") -> "Protocol":
+        """Return a copy with the step at ``index`` (0-based) removed."""
+        if not (0 <= index < len(self.steps)):
+            raise IndexError("step index out of range")
+        if len(self.steps) == 1:
+            raise ValueError("cannot remove the only step of a protocol")
+        remaining = tuple(step for i, step in enumerate(self.steps) if i != index)
+        return replace(self, name=f"{self.name}{name_suffix}", steps=remaining)
+
+    def reordered(self, order: Sequence[int], name_suffix: str = " (reordered)") -> "Protocol":
+        """Return a copy whose steps follow ``order`` (a permutation of indices)."""
+        if sorted(order) != list(range(len(self.steps))):
+            raise ValueError("order must be a permutation of the step indices")
+        return replace(
+            self,
+            name=f"{self.name}{name_suffix}",
+            steps=tuple(self.steps[i] for i in order),
+        )
+
+    def with_step_replaced(
+        self, index: int, technique_key: str, name_suffix: str = " (step substituted)"
+    ) -> "Protocol":
+        if not (0 <= index < len(self.steps)):
+            raise IndexError("step index out of range")
+        if technique_key not in TECHNIQUE_INDEX:
+            raise ValueError(f"unknown technique: {technique_key}")
+        steps = list(self.steps)
+        old = steps[index]
+        steps[index] = Step(
+            technique_key=technique_key,
+            duration_min=old.duration_min,
+            intensity=None,
+            note=f"substituted for {old.technique_key}",
+        )
+        return replace(self, name=f"{self.name}{name_suffix}", steps=tuple(steps))
+
+    def with_duration_scaled(self, factor: float, name_suffix: str = "") -> "Protocol":
+        if not (0.1 <= factor <= 10.0):
+            raise ValueError("duration factor must lie between 0.1 and 10")
+        return replace(
+            self,
+            name=f"{self.name}{name_suffix}",
+            steps=tuple(
+                Step(
+                    technique_key=step.technique_key,
+                    duration_min=max(1.0 / 60.0, min(MAX_STEP_MINUTES, step.duration_min * factor)),
+                    intensity=step.intensity,
+                    note=step.note,
+                )
+                for step in self.steps
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "duration_min": round(self.duration_min, 2),
+            "signature": self.signature(),
+            "steps": [
                 {
-                    "variable": name,
-                    "label": info["label"],
-                    "value": round(float(getattr(self, name)), 3),
-                    "how it enters the model": info["help"],
+                    "technique_key": step.technique_key,
+                    "technique": step.technique.label,
+                    "minutes": round(float(step.duration_min), 2),
+                    "intensity": round(step.resolved_intensity(), 2),
+                    "note": step.note,
                 }
+                for step in self.steps
+            ],
+        }
+
+    # -- constructors ---------------------------------------------------- #
+
+    @classmethod
+    def from_rows(cls, rows: Iterable[dict[str, Any]], name: str) -> "Protocol":
+        """Build a protocol from the app's editable step table."""
+        steps = []
+        for row in rows:
+            technique_key = row.get("technique_key") or row.get("technique")
+            if technique_key is None:
+                raise ValueError("each row needs a technique_key")
+            duration = row.get("minutes", row.get("duration_min", 2.0))
+            intensity = row.get("intensity")
+            if intensity is not None and pd.isna(intensity):
+                intensity = None
+            steps.append(
+                Step(
+                    technique_key=str(technique_key),
+                    duration_min=float(duration),
+                    intensity=None if intensity is None else float(intensity),
+                )
             )
-        return pd.DataFrame(rows)
+        return cls(name=name, steps=tuple(steps))
 
 
 # --------------------------------------------------------------------------- #
@@ -139,37 +199,42 @@ class Protocol:
 # --------------------------------------------------------------------------- #
 
 BASELINE_DEFINITION = (
-    "BASELINE CONDITION (modelling convention, not a control group). A fixed, "
-    "unstructured 'ordinary interaction' reference: no deliberate structure, moderate "
-    "communication, occasional comfort checks and no systematic adaptation to the "
-    "individual. The exact values are visible in the protocol table and are identical "
-    "for every couple. Because the baseline is a convention rather than a measurement, "
-    "it largely determines the size of any baseline-versus-guide difference: choosing "
-    "lower baseline values makes almost any structured protocol look better."
+    "BASELINE CONDITION (modelling convention, not a control group). A short, "
+    "unstructured interaction: brief non-genital contact, a little labial work, then "
+    "straight to direct glans stimulation with no check-ins and no pacing discipline. "
+    "It is a deliberate contrast to a structured guide and it is visible in full in the "
+    "app. Because it is a convention rather than a measurement, it sets much of the "
+    "size of any difference you observe: a harsher baseline makes any guide look better."
 )
 
 BASELINE_PROTOCOL = Protocol(
-    consistency=0.40,
-    feedback_responsiveness=0.35,
-    adaptation=0.30,
-    communication=0.40,
-    comfort_checks=0.30,
-    boundary_respect=0.55,
-    adherence=0.40,
-    label="baseline",
-    guide_reference_text="",
+    name="baseline",
+    steps=(
+        Step("thighs_kissing", 1.0, note="brief priming"),
+        Step("outer_labia", 2.0),
+        Step("inner_labia", 1.5),
+        Step("clitoral_glans", 4.0, note="straight to direct contact, no hood transition"),
+    ),
 )
 
+REFERENCE_PROTOCOL = BASELINE_PROTOCOL
 
-def default_guide_protocol() -> Protocol:
-    """A neutral starting point for the user-configured condition."""
+
+def default_structured_protocol() -> Protocol:
+    """A paced, consent-forward starting point for the user's condition."""
     return Protocol(
-        consistency=0.65,
-        feedback_responsiveness=0.70,
-        adaptation=0.70,
-        communication=0.70,
-        comfort_checks=0.65,
-        boundary_respect=0.85,
-        adherence=0.65,
-        label="user_configured",
+        name="structured guide",
+        steps=(
+            Step("thighs_kissing", 2.0),
+            Step("outer_labia", 3.0),
+            Step("inner_labia", 3.0),
+            Step("perineum", 1.5),
+            Step("check_in", 0.5),
+            Step("clitoral_hood", 4.0),
+            Step("flat_tongue", 4.0),
+            Step("check_in", 0.5),
+            Step("clitoral_glans", 5.0),
+            Step("suction", 2.0),
+            Step("check_in", 0.5),
+        ),
     )

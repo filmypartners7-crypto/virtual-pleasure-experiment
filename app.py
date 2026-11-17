@@ -1,12 +1,12 @@
-"""Streamlit dashboard for the Virtual Pleasure Experiment.
+"""Streamlit dashboard for VPE 0.3.0.
 
-Run with::
+Flow: paste your guide -> the parser proposes steps -> you correct them -> choose
+what to compare -> run -> read distributions, ablations, ordering and subgroup
+results -> export.
 
-    streamlit run app.py
-
-The dashboard has seven sections (A-G), including research-source provenance. It shows a clear
-empty state until an experiment has been run, and it never presents simulated
-output as evidence about real people.
+The parser is a keyword matcher, not a language model. The review step is not a
+formality: correct the technique, duration and intensity of every step before you
+trust any result.
 """
 
 from __future__ import annotations
@@ -17,38 +17,46 @@ import pandas as pd
 import streamlit as st
 
 from vpe import visualization as viz
+from vpe.calibration import CALIBRATION_REPORT, calibration_check, reference_distribution_frame
 from vpe.disclaimer import (
     CANNOT_ESTABLISH,
     CAN_ESTABLISH,
-    EVIDENCE_STATUS_STATEMENT,
-    KEY_ASSUMPTIONS,
+    KEY_LIMITATIONS,
     SYNTHETIC_DISCLAIMER,
+    evidence_statement,
 )
-from vpe.experiment import ExperimentResult, run_experiment
-from vpe.empirical_scenario import empirical_scenario_distribution
-from vpe.research import RESEARCH_STUDIES, reference_distribution_table, satisfaction_factors_table
+from vpe.evidence import (
+    MODEL_VERSION,
+    evidence_coverage,
+    evidence_summary_text,
+    parameter_evidence_frame,
+    studies_frame,
+)
+from vpe.experiment import run_experiment
 from vpe.export import results_to_csv_bytes, settings_to_json_bytes
-from vpe.model_config import MODEL_VERSION, ModelConfig, default_config
+from vpe.guide_parser import parse_guide
 from vpe.population import (
-    PROFILE_COLUMNS,
-    distributions_table,
+    ARCHETYPES,
+    NUMERIC_PROFILE_COLUMNS,
+    archetypes_frame,
+    generate_population,
     population_variability,
+    population_variables_frame,
 )
 from vpe.protocol import (
     BASELINE_DEFINITION,
     BASELINE_PROTOCOL,
-    PROTOCOL_VARIABLE_INFO,
-    PROTOCOL_VARIABLES,
     Protocol,
-    default_guide_protocol,
+    Step,
+    default_structured_protocol,
 )
-from vpe.response_model import OUTCOME_COLUMNS, equations_text, outcome_columns
-from vpe.statistics import paired_interval_table, sensitivity_analysis, subgroup_summary
+from vpe.sequence_model import DEFAULT_PARAMETERS, OUTCOME_COLUMNS, parameters_frame
+from vpe.techniques import TECHNIQUES, TECHNIQUE_INDEX, techniques_frame
 
-RESULT_KEY = "vpe_result"
-SENSITIVITY_KEY = "vpe_sensitivity"
+RESULT_KEY = "vpe3_result"
+STEPS_KEY = "vpe3_steps"
+TEXT_KEY = "vpe3_guide_text"
 
-# Streamlit renamed `use_container_width` to `width`; support both.
 _PLOT_KW = (
     {"width": "stretch"}
     if "width" in inspect.signature(st.plotly_chart).parameters
@@ -60,24 +68,11 @@ _DATA_KW = (
     else {"use_container_width": True}
 )
 
-OUTCOME_CHOICES = {
-    "subjective_arousal": "Subjective arousal",
+OUTCOME_LABELS = {
     "pleasure": "Pleasure",
     "comfort": "Comfort",
+    "discomfort": "Discomfort",
     "satisfaction": "Satisfaction",
-    "discomfort_risk": "Discomfort risk",
-}
-
-SUBGROUP_CHOICES = {
-    "female_comfort_sensitivity": "Comfort sensitivity (synthetic profile)",
-    "female_preference_specificity": "Preference specificity (synthetic profile)",
-    "female_psychological_context": "Psychological context (synthetic profile)",
-    "female_communication_preference": "Communication preference (synthetic profile)",
-    "male_feedback_responsiveness": "Male feedback responsiveness (synthetic profile)",
-    "male_adherence_variability": "Male adherence variability (synthetic profile)",
-    "female_age_category": "Female age category",
-    "male_age_category": "Male age category",
-    "relationship_duration_years": "Relationship duration (years)",
 }
 
 
@@ -89,637 +84,479 @@ def table(frame: pd.DataFrame, **kwargs) -> None:
     st.dataframe(frame, hide_index=True, **_DATA_KW, **kwargs)
 
 
-def current_result() -> ExperimentResult | None:
-    return st.session_state.get(RESULT_KEY)
+def steps_frame_from_state() -> pd.DataFrame:
+    steps = st.session_state.get(STEPS_KEY, [])
+    if not steps:
+        return pd.DataFrame(columns=["step", "technique_key", "minutes", "intensity"])
+    return pd.DataFrame(steps)
 
 
-def empty_state(section: str) -> None:
-    st.info(
-        f"No experiment has been run yet. {section} fills in after you press "
-        "**Run experiment** in section A. Nothing is pre-computed or mocked."
-    )
+def state_from_frame(frame: pd.DataFrame) -> list[dict]:
+    rows = []
+    for position, row in enumerate(frame.to_dict("records"), start=1):
+        technique_key = row.get("technique_key")
+        if technique_key not in TECHNIQUE_INDEX:
+            continue
+        minutes = float(row.get("minutes", 2.0))
+        intensity = row.get("intensity")
+        if intensity is None or pd.isna(intensity):
+            intensity = None
+        rows.append(
+            {
+                "step": position,
+                "technique_key": technique_key,
+                "minutes": max(0.1, min(15.0, minutes)),
+                "intensity": None if intensity is None else max(0.0, min(1.0, float(intensity))),
+            }
+        )
+    return rows
 
 
 # --------------------------------------------------------------------------- #
-# Page setup
+# Page
 # --------------------------------------------------------------------------- #
 
 st.set_page_config(
-    page_title="Virtual Pleasure Experiment (VPE)",
-    page_icon=None,
+    page_title="Virtual Pleasure Experiment 0.3.0",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-st.title("Virtual Pleasure Experiment (VPE)")
+st.title("Virtual Pleasure Experiment")
 st.caption(
-    f"Model version {MODEL_VERSION} - a research-anchored synthetic scenario model "
-    "with 1,000 configurable adult couples."
+    f"Model version {MODEL_VERSION} - a sequence simulation over 1,000 synthetic adult women, "
+    "with a null scenario calibrated to published survey marginals."
 )
 
-st.error(
-    "**Research anchor, synthetic participants.** One satisfaction reference distribution is "
-    "resampled from published aggregate survey percentages for receiving oral sex. The guide's "
-    "effect is not measured by that study: all protocol-effect settings and continuous response "
-    "equations are hypothetical. Results are not real-world success rates."
+st.warning(
+    "**Synthetic women, hypothetical mechanisms.** The population's satisfaction level is "
+    "calibrated to published aggregate data. Every technique, sequence and comfort mechanism "
+    "is an assumption that no study has estimated. Results explore what your assumptions imply; "
+    "they are not evidence that a technique works."
 )
 
 tabs = st.tabs(
     [
-        "A - Experiment configuration",
-        "B - Population overview",
-        "C - Experiment results",
-        "D - Individual variation",
-        "E - Sensitivity analysis",
-        "F - Scientific limitations",
-        "G - Research evidence",
+        "A - Guide input",
+        "B - Compare",
+        "C - Results",
+        "D - Steps & order",
+        "E - Individual differences",
+        "F - Evidence",
+        "G - Limitations",
     ]
 )
 
 # --------------------------------------------------------------------------- #
-# A. Experiment configuration
+# A. Guide input
 # --------------------------------------------------------------------------- #
 
 with tabs[0]:
-    st.subheader("A. Experiment configuration")
-
-    col_left, col_right = st.columns([1, 2], gap="large")
-
-    with col_left:
-        population_size = st.number_input(
-            "Synthetic couples",
-            min_value=10,
-            max_value=20000,
-            value=1000,
-            step=100,
-            help="Default is 1,000 couples, as specified. Each couple has one synthetic male and one synthetic female adult profile.",
-        )
-        seed = st.number_input(
-            "Random seed",
-            min_value=0,
-            max_value=2**32 - 1,
-            value=42,
-            step=1,
-            help="Same seed + same protocol + same coefficients reproduce exactly the same results.",
-        )
-        include_orgasm = st.checkbox(
-            "Also compute the optional orgasm-related estimate",
-            value=False,
-            help=(
-                "Off by default. When enabled it is a separate, unvalidated hypothetical model "
-                "estimate. The model never treats orgasm as a consequence of any protocol."
-            ),
-        )
-
-    with col_right:
-        st.markdown("**Protocol variables** (each on a 0-1 scale)")
-        defaults = default_guide_protocol()
-        protocol_values: dict[str, float] = {}
-        slider_columns = st.columns(2)
-        for index, variable in enumerate(PROTOCOL_VARIABLES):
-            info = PROTOCOL_VARIABLE_INFO[variable]
-            target = slider_columns[index % 2]
-            protocol_values[variable] = target.slider(
-                info["label"],
-                min_value=0.0,
-                max_value=1.0,
-                value=float(getattr(defaults, variable)),
-                step=0.05,
-                help=info["help"],
-                key=f"protocol_{variable}",
-            )
-
-    assumed_effect_logit = st.slider(
-        "Hypothetical guide-effect assumption (logit units per full protocol-score point)",
-        min_value=-3.0,
-        max_value=3.0,
-        value=0.0,
-        step=0.1,
-        help=(
-            "This is NOT estimated from research. Zero means no assumed change from the published "
-            "reference distribution. Positive/negative values explore favourable/unfavourable "
-            "what-if scenarios. The source survey did not test your guide."
-        ),
+    st.subheader("A. Paste your guide")
+    st.caption(
+        "The parser is a keyword matcher, not a language model. It will misread some lines. "
+        "You correct it in the table below - that correction is the experiment's input, so it "
+        "is worth doing carefully."
     )
 
     guide_text = st.text_area(
-        "Guide reference text (optional, for your own reference)",
-        height=140,
-        placeholder="Paste your guide here. It is stored with the experiment settings but is NOT parsed.",
-        help=(
-            "The application does not read, summarise or interpret this text. You decide which "
-            "slider value corresponds to which part of your guide."
-        ),
+        "Your guide",
+        value=st.session_state.get(TEXT_KEY, ""),
+        height=260,
+        placeholder="Paste your full guide here, one step per line or numbered.",
+        key="guide_text_area",
     )
 
-    run_col, rerun_col = st.columns([1, 3])
-    run_clicked = run_col.button("Run experiment", type="primary")
-
-    if run_clicked:
-        try:
-            protocol = Protocol(**protocol_values, label="user_configured", guide_reference_text=guide_text)
-            config = default_config(include_orgasm_estimate=bool(include_orgasm))
-            with st.spinner("Generating synthetic population and running both conditions..."):
-                result = run_experiment(
-                    population_size=int(population_size),
-                    seed=int(seed),
-                    protocol=protocol,
-                    config=config,
-                    assumed_effect_logit=float(assumed_effect_logit),
+    parse_col, load_col, clear_col = st.columns([1, 1, 1])
+    if parse_col.button("Parse guide into steps", type="primary"):
+        st.session_state[TEXT_KEY] = guide_text
+        result = parse_guide(guide_text)
+        if not result.steps:
+            st.error("No steps recognised. Add technique words such as 'labia', 'hood', 'glans'.")
+        else:
+            st.session_state[STEPS_KEY] = state_from_frame(result.frame())
+            st.success(result.summary_text())
+            for warning in result.warnings:
+                st.info(warning)
+            if result.unclassified_blocks:
+                st.warning(
+                    "These blocks were not recognised and are not in the sequence. Add them "
+                    "manually with the 'Add a step' control:\n\n- "
+                    + "\n- ".join(result.unclassified_blocks)
                 )
-            st.session_state[RESULT_KEY] = result
-            st.session_state.pop(SENSITIVITY_KEY, None)
-            st.success(
-                f"Ran {result.population_size:,} paired synthetic couples. Seed {result.seed}, "
-                f"run fingerprint `{result.fingerprint()}`."
-            )
-        except ValueError as error:
-            st.error(f"Could not run the experiment: {error}")
 
-    result = current_result()
-    if result is not None:
-        with rerun_col:
-            new_seed = st.number_input(
-                "Re-run with a different seed",
-                min_value=0,
-                max_value=2**32 - 1,
-                value=(result.seed + 1) % (2**32),
-                step=1,
-                key="rerun_seed",
-            )
-            if st.button("Re-run with this seed"):
-                protocol_dict = {
-                    key: value
-                    for key, value in result.settings["protocol"].items()
-                    if key in Protocol.__dataclass_fields__
-                }
-                config_dict = {
-                    key: value
-                    for key, value in result.settings["model_config"].items()
-                    if key in ModelConfig.__dataclass_fields__
-                }
-                with st.spinner("Re-running with a new synthetic population..."):
-                    rerun = run_experiment(
-                        population_size=result.population_size,
-                        seed=int(new_seed),
-                        protocol=Protocol(**protocol_dict),
-                        config=ModelConfig(**config_dict),
-                        assumed_effect_logit=float(result.settings.get("assumed_effect_logit", 0.0)),
-                    )
-                st.session_state[RESULT_KEY] = rerun
-                st.session_state.pop(SENSITIVITY_KEY, None)
-                st.success(f"Re-ran with seed {rerun.seed}. Fingerprint `{rerun.fingerprint()}`.")
-
-    with st.expander("How each structured variable enters the model", expanded=False):
-        st.markdown(
-            "Each slider maps to a named term in the hypothetical response equations. The guide "
-            "text is not automatically interpreted: you manually map your guide to these sliders. "
-            "The empirical satisfaction scenario separately uses the equal-weight average of the "
-            "seven slider values and the explicitly hypothetical effect coefficient above."
-        )
-        table(
+    if load_col.button("Load a paced example"):
+        st.session_state[STEPS_KEY] = state_from_frame(
             pd.DataFrame(
                 [
                     {
-                        "variable": variable,
-                        "label": PROTOCOL_VARIABLE_INFO[variable]["label"],
-                        "how it enters the model": PROTOCOL_VARIABLE_INFO[variable]["help"],
+                        "technique_key": step.technique_key,
+                        "minutes": round(float(step.duration_min), 2),
+                        "intensity": step.resolved_intensity(),
                     }
-                    for variable in PROTOCOL_VARIABLES
+                    for step in default_structured_protocol().steps
                 ]
             )
         )
-        st.markdown("**Baseline condition (visible and fixed)**")
-        st.write(BASELINE_DEFINITION)
-        baseline_frame = pd.DataFrame(
-            [
-                {
-                    "variable": variable,
-                    "label": PROTOCOL_VARIABLE_INFO[variable]["label"],
-                    "baseline value": round(float(getattr(BASELINE_PROTOCOL, variable)), 2),
-                }
-                for variable in PROTOCOL_VARIABLES
-            ]
-        )
-        table(baseline_frame)
+        st.info("Loaded the paced example protocol. Edit it, or paste your own guide above.")
 
-    with st.expander("The model equations and coefficient evidence", expanded=False):
-        config_for_text = default_config(include_orgasm_estimate=bool(include_orgasm))
-        st.code(equations_text(config_for_text), language="text")
-        st.markdown(EVIDENCE_STATUS_STATEMENT)
-        table(config_for_text.evidence_table())
-        chart(viz.evidence_counts_chart(config_for_text.evidence_summary()))
+    if clear_col.button("Clear steps"):
+        st.session_state[STEPS_KEY] = []
+        st.session_state.pop(RESULT_KEY, None)
+
+    st.divider()
+    st.markdown("**Review and correct the sequence**")
+    st.caption(
+        "Change the technique, minutes or intensity of any row. Duration matters as much as "
+        "order: a step that lasts 20 seconds is not the same intervention as one that lasts "
+        "three minutes."
+    )
+
+    current = steps_frame_from_state()
+    if current.empty:
+        st.info("No steps yet. Parse a guide, load the example, or add a step below.")
+        seed_frame = pd.DataFrame([{"technique_key": "outer_labia", "minutes": 3.0, "intensity": 0.30}])
+    else:
+        seed_frame = current[["technique_key", "minutes", "intensity"]]
+
+    edited = st.data_editor(
+        seed_frame,
+        num_rows="dynamic",
+        key="step_editor",
+        column_config={
+            "technique_key": st.column_config.SelectboxColumn(
+                "technique",
+                help="Technique key. See the catalogue in section F.",
+                options=[technique.key for technique in TECHNIQUES],
+                required=True,
+            ),
+            "minutes": st.column_config.NumberColumn(
+                "minutes", min_value=0.1, max_value=15.0, step=0.1, format="%.1f"
+            ),
+            "intensity": st.column_config.NumberColumn(
+                "intensity (blank = default)", min_value=0.0, max_value=1.0, step=0.05, format="%.2f"
+            ),
+        },
+        **_DATA_KW,
+    )
+    st.session_state[STEPS_KEY] = state_from_frame(edited)
+
+    total_minutes = sum(row["minutes"] for row in st.session_state[STEPS_KEY])
+    st.caption(f"{len(st.session_state[STEPS_KEY])} steps, {total_minutes:.1f} minutes total.")
+
+    with st.expander("Technique catalogue and what each parameter means"):
+        table(techniques_frame())
 
 # --------------------------------------------------------------------------- #
-# B. Population overview
+# B. Compare
 # --------------------------------------------------------------------------- #
 
 with tabs[1]:
-    st.subheader("B. Population overview")
-    result = current_result()
-    if result is None:
-        empty_state("The population overview")
-    else:
-        profiles = result.profiles
-        metric_columns = st.columns(4)
-        metric_columns[0].metric("Synthetic couples", f"{len(profiles):,}")
-        metric_columns[1].metric("Synthetic profiles", f"{len(profiles) * 2:,}")
-        metric_columns[2].metric("Random seed", f"{result.seed}")
-        metric_columns[3].metric("Run fingerprint", result.fingerprint())
+    st.subheader("B. What should be compared?")
+    st.caption(
+        "Both conditions run on the same 1,000 synthetic women, so a difference is never caused "
+        "by a different random draw."
+    )
 
-        st.caption(
-            "All profiles are computer-generated adults (18+). Age bands and profile variables are "
-            "sampled from documented distributions; they are not prevalence estimates for any real "
-            "population."
-        )
+    user_steps = st.session_state.get(STEPS_KEY, [])
+    user_protocol: Protocol | None = None
+    if user_steps:
+        try:
+            user_protocol = Protocol.from_rows(user_steps, name="your guide")
+        except ValueError as error:
+            st.error(f"Your step table is not yet a valid protocol: {error}")
 
-        st.info(
-            "The empirical reference category is resampled from rounded published aggregate "
-            "percentages. Other individual profile traits are generated from hypothetical "
-            "distributions and are not calibrated to that survey."
-        )
-        variable = st.selectbox(
-            "Profile variable to display",
-            options=PROFILE_COLUMNS + ["relationship_duration_years", "empirical_reference_category"],
-            format_func=lambda name: name.replace("_", " "),
-        )
-        chart(viz.population_histogram(profiles, variable))
+    options: dict[str, Protocol] = {"Baseline (unstructured convention)": BASELINE_PROTOCOL}
+    if user_protocol is not None:
+        options["Your guide"] = user_protocol
+    options["Paced example"] = default_structured_protocol()
 
-        st.markdown("**Population variability**")
-        table(population_variability(profiles))
+    left, right = st.columns(2)
+    label_a = left.selectbox("Condition A", list(options), index=0)
+    default_b_index = 1 if len(options) > 1 else 0
+    label_b = right.selectbox("Condition B", list(options), index=default_b_index)
 
-        with st.expander("Documented profile distributions"):
-            table(distributions_table())
+    size_col, seed_col, run_col = st.columns([1, 1, 1])
+    population_size = size_col.number_input("Synthetic women", 100, 20000, 1000, 100)
+    seed = seed_col.number_input("Random seed", 0, 2**32 - 1, 42, 1)
+    run_clicked = run_col.button("Run experiment", type="primary")
 
-        with st.expander("Empirical reference-category composition"):
-            reference_counts = (
-                profiles["empirical_reference_category"]
-                .value_counts(normalize=True)
-                .mul(100)
-                .rename("synthetic cohort percent")
-                .reset_index()
-                .rename(columns={"index": "category"})
-            )
-            table(reference_counts)
-            st.caption("These percentages vary around the published aggregate marginals because 1,000 synthetic rows are sampled.")
+    with st.expander("The baseline convention, in full", expanded=False):
+        st.write(BASELINE_DEFINITION)
+        table(BASELINE_PROTOCOL.as_frame())
 
-        with st.expander("Age composition of the synthetic population"):
-            age_table = (
-                pd.concat(
-                    [
-                        profiles["male_age_category"].value_counts().rename("male profiles"),
-                        profiles["female_age_category"].value_counts().rename("female profiles"),
-                    ],
-                    axis=1,
+    if run_clicked:
+        if label_a == label_b:
+            st.error("Choose two different conditions to compare.")
+        elif user_protocol is None and "Your guide" in (label_a, label_b):
+            st.error("Your guide has no steps yet. Parse or build one in section A.")
+        else:
+            with st.spinner("Simulating both protocols, ablations, ordering variants and sensitivity..."):
+                result = run_experiment(
+                    population_size=int(population_size),
+                    seed=int(seed),
+                    protocol_a=options[label_a],
+                    protocol_b=options[label_b],
+                    label_a=label_a,
+                    label_b=label_b,
                 )
-                .fillna(0)
-                .astype(int)
-                .sort_index()
+            st.session_state[RESULT_KEY] = result
+            st.success(
+                f"Ran {result.population_size:,} synthetic women. Fingerprint "
+                f"`{result.fingerprint()}`."
             )
-            table(age_table.reset_index().rename(columns={"index": "age category"}))
+
+    result = st.session_state.get(RESULT_KEY)
+    if result is None:
+        st.info("No experiment yet. Pick two conditions and press **Run experiment**.")
+    else:
+        st.caption(
+            f"Loaded run: seed {result.seed}, {result.population_size:,} women, "
+            f"{result.label_a} vs {result.label_b}, fingerprint `{result.fingerprint()}`."
+        )
+        table(pd.DataFrame([result.settings["protocol_a"]]).drop(columns=["steps"]).rename(
+            columns=lambda c: f"A_{c}"))
 
 # --------------------------------------------------------------------------- #
-# C. Experiment results
+# C. Results
 # --------------------------------------------------------------------------- #
 
 with tabs[2]:
-    st.subheader("C. Experiment results")
-    result = current_result()
+    st.subheader("C. Results")
+    result = st.session_state.get(RESULT_KEY)
     if result is None:
-        empty_state("The results section")
+        st.info("Run an experiment in section B first. Nothing is pre-computed.")
     else:
         st.markdown(
-            "Mean paired differences are reported with bootstrap percentile intervals "
-            "**conditional on the model**. These are not clinical confidence intervals and they "
-            "exclude the (larger) uncertainty in the model's assumptions."
+            f"Mean differences are **{result.label_b} minus {result.label_a}**, paired within "
+            "woman. Intervals are bootstrap percentile intervals conditional on the model - not "
+            "confidence intervals for anything real."
         )
-        intervals = paired_interval_table(result.paired, result.outcomes)
-        table(
-            result.summary.merge(intervals, on=["outcome", "mean_paired_diff"], how="left")
+        merged = result.summary.merge(
+            result.intervals[["outcome", "interval_low", "interval_high", "interval_type"]],
+            on="outcome",
+            how="left",
         )
+        table(merged)
 
-        chart(viz.summary_dot_plot(result.summary))
+        left, right = st.columns(2)
+        with left:
+            chart(viz.trajectory_chart(result.trajectory_a, result.trajectory_b, result.label_a, result.label_b))
+        with right:
+            chart(viz.paired_scatter(result.paired, "pleasure", result.label_a, result.label_b))
 
-        first, second = st.columns(2)
-        with first:
-            chart(viz.condition_overlay(result.baseline, result.guide, "pleasure"))
-            chart(viz.condition_overlay(result.baseline, result.guide, "comfort"))
-        with second:
-            chart(viz.condition_overlay(result.baseline, result.guide, "subjective_arousal"))
-            chart(viz.condition_overlay(result.baseline, result.guide, "satisfaction"))
-
-        st.markdown("**Discomfort risk indicator (separate mechanism)**")
-        st.caption(
-            "Discomfort risk is computed by its own equation - boundary lapses, absent comfort "
-            "checks, communication gaps and instability. It is not defined as 1 minus comfort."
+        outcome = st.selectbox(
+            "Distribution to inspect",
+            options=list(OUTCOME_COLUMNS),
+            format_func=lambda key: OUTCOME_LABELS.get(key, key),
+            key="dist_outcome",
         )
-        chart(viz.condition_overlay(result.baseline, result.guide, "discomfort_risk"))
+        chart(viz.distribution_comparison(result.condition_a, result.condition_b, outcome, result.label_a, result.label_b))
 
         st.divider()
-        st.markdown("**Research-anchored satisfaction scenario**")
-        st.caption(
-            "This is separate from the continuous response equations above. The starting categories "
-            "are resampled from a published survey of receiving oral sex. The guide shift is a "
-            "hypothetical what-if parameter, not an effect measured in that study."
+        st.markdown("**Export**")
+        st.caption(SYNTHETIC_DISCLAIMER)
+        download_left, download_right = st.columns(2)
+        download_left.download_button(
+            "Download per-woman CSV",
+            data=results_to_csv_bytes(result),
+            file_name=f"vpe3_results_seed{result.seed}.csv",
+            mime="text/csv",
         )
-        emp_distribution = empirical_scenario_distribution(result.empirical_scenario)
-        chart(viz.empirical_satisfaction_comparison(emp_distribution))
-        emp_meta = result.empirical_scenario_metadata
-        practiced = max(int(emp_meta["practiced_count"]), 1)
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Moved to a higher category", f"{100 * emp_meta['moved_up_count'] / practiced:.1f}%")
-        m2.metric("Unchanged category", f"{100 * emp_meta['unchanged_count'] / practiced:.1f}%")
-        m3.metric("Moved to a lower category", f"{100 * emp_meta['moved_down_count'] / practiced:.1f}%")
-        m4.metric("Assumed logit shift", f"{emp_meta['applied_latent_logit_shift']:.2f}")
-        st.caption(
-            f"Movement percentages use {emp_meta['practiced_count']:,} synthetic participants classified as having practised receiving oral sex in the reference survey; the {emp_meta['not_practiced_count']:,} 'not practiced' profiles are held unchanged. These are scenario movements, not observed improvements."
+        download_right.download_button(
+            "Download full JSON record",
+            data=settings_to_json_bytes(result),
+            file_name=f"vpe3_record_seed{result.seed}.json",
+            mime="application/json",
         )
-        with st.expander("How the research-anchored scenario is calculated"):
-            st.write(emp_meta["assumption_warning"])
-            st.code(
-                "guide_shift = assumed_effect_logit × (guide_mean_slider_score - baseline_mean_slider_score)\n"
-                "guide_category = ordinal_cutpoints(published_reference_utility + guide_shift)",
-                language="text",
-            )
-            st.json(emp_meta)
-            table(emp_distribution)
-
-        if "orgasm_estimate_hypothetical" in result.outcomes:
-            st.warning(
-                "The optional orgasm-related estimate is displayed as an unvalidated hypothetical "
-                "model output. It is not a prediction about any person and must not be presented "
-                "as a success rate."
-            )
-            chart(viz.condition_overlay(result.baseline, result.guide, "orgasm_estimate_hypothetical"))
-
-        with st.expander("Export results"):
-            st.caption(SYNTHETIC_DISCLAIMER)
-            download_columns = st.columns(2)
-            download_columns[0].download_button(
-                "Download results CSV",
-                data=results_to_csv_bytes(result),
-                file_name=f"vpe_results_seed{result.seed}.csv",
-                mime="text/csv",
-                help="Per-couple synthetic profiles, both conditions and paired differences. The disclaimer is the header of the file.",
-            )
-            download_columns[1].download_button(
-                "Download settings JSON",
-                data=settings_to_json_bytes(result),
-                file_name=f"vpe_settings_seed{result.seed}.json",
-                mime="application/json",
-                help="Protocol, baseline definition, coefficients, evidence labels, equations, seed and model version.",
-            )
-            st.json(
-                {
-                    "model_version": result.settings["model_version"],
-                    "random_seed": result.settings["random_seed"],
-                    "population_size": result.settings["population_size"],
-                    "run_fingerprint": result.settings["run_fingerprint"],
-                    "protocol": result.settings["protocol"],
-                    "interval_labelling": result.settings["interval_labelling"],
-                }
-            )
 
 # --------------------------------------------------------------------------- #
-# D. Individual variation
+# D. Steps and order
 # --------------------------------------------------------------------------- #
 
 with tabs[3]:
-    st.subheader("D. Individual variation")
-    result = current_result()
+    st.subheader("D. What each step does, and whether order matters")
+    result = st.session_state.get(RESULT_KEY)
     if result is None:
-        empty_state("The individual-variation section")
+        st.info("Run an experiment in section B first.")
     else:
         outcome = st.selectbox(
             "Outcome",
-            options=[column for column in OUTCOME_COLUMNS if column in result.outcomes],
-            format_func=lambda name: OUTCOME_CHOICES.get(name, name),
-            key="variation_outcome",
+            options=list(OUTCOME_COLUMNS),
+            format_func=lambda key: OUTCOME_LABELS.get(key, key),
+            key="step_outcome",
         )
-        left, right = st.columns(2)
-        with left:
-            chart(viz.paired_scatter(result.paired, outcome))
-        with right:
-            chart(viz.paired_difference_hist(result.paired, outcome))
 
-        st.markdown("**Subgroup comparison**")
-        subgroup_variable = st.selectbox(
-            "Group couples by",
-            options=list(SUBGROUP_CHOICES),
-            format_func=lambda name: SUBGROUP_CHOICES[name],
-            key="subgroup_variable",
-        )
-        bins = 3 if pd.api.types.is_numeric_dtype(result.profiles[subgroup_variable]) else 0
-        if bins:
-            subgroup_table = subgroup_summary(
-                result.paired, result.profiles, by=subgroup_variable, outcome=outcome, bins=bins
-            )
-        else:
-            subgroup_table = subgroup_summary(
-                result.paired, result.profiles, by=subgroup_variable, outcome=outcome
-            )
-        chart(viz.subgroup_bars(subgroup_table, outcome))
-        table(subgroup_table)
-
-        st.markdown("**Example synthetic response profiles**")
+        st.markdown(f"**Ablation: remove one step of {result.label_b} at a time**")
         st.caption(
-            "The couples with the largest positive and largest negative paired differences, shown "
-            "with their generated profile variables. These are synthetic individuals, not case studies."
+            "A negative bar means removing that step made things worse, so the step was doing "
+            "work under these assumptions."
         )
-        difference_column = f"diff_{outcome}"
-        merged = result.profiles.merge(
-            result.paired[["couple_id", difference_column]], on="couple_id", how="left"
-        )
-        columns_to_show = [
-            "couple_id",
-            "male_age_category",
-            "female_age_category",
-            difference_column,
-            *PROFILE_COLUMNS,
-        ]
-        most_increase = merged.nlargest(5, difference_column)[columns_to_show]
-        most_decrease = merged.nsmallest(5, difference_column)[columns_to_show]
-        st.markdown("_Largest increases (guide minus baseline)_")
-        table(most_increase)
-        st.markdown("_Largest decreases (guide minus baseline)_")
-        table(most_decrease)
+        if result.ablations.empty:
+            st.info("No ablation results.")
+        else:
+            chart(viz.ablation_chart(result.ablations, outcome))
+            table(
+                result.ablations[
+                    ["removed_step", "removed_technique", f"delta_{outcome}"]
+                    + [c for c in result.ablations.columns if c.startswith("delta_") and c != f"delta_{outcome}"]
+                ].round(3)
+            )
+
+        st.divider()
+        st.markdown("**Ordering: the same steps in a different order**")
+        if result.sequence_variants.empty:
+            st.info("No ordering variants available for this protocol.")
+        else:
+            chart(viz.variants_chart(result.sequence_variants, outcome))
+            table(result.sequence_variants.round(3))
+
+        st.divider()
+        st.markdown("**Substitution: swap one technique at the same position**")
+        if result.substitutions.empty:
+            st.info("No substitutions were applicable to this protocol.")
+        else:
+            table(result.substitutions.round(3))
 
 # --------------------------------------------------------------------------- #
-# E. Sensitivity analysis
+# E. Individual differences
 # --------------------------------------------------------------------------- #
 
 with tabs[4]:
-    st.subheader("E. Sensitivity analysis")
-    result = current_result()
+    st.subheader("E. Individual differences")
+    result = st.session_state.get(RESULT_KEY)
     if result is None:
-        empty_state("The sensitivity section")
+        st.info("Run an experiment in section B first.")
     else:
-        st.markdown(
-            "Each coefficient is moved up and down by a fixed percentage (clipped to its documented "
-            "range) and the model is re-run with identical noise draws. The result shows how much "
-            "the conclusions depend on the assumptions - it is **not** evidence about real people."
-        )
-        controls = st.columns(3)
-        sensitivity_outcome = controls[0].selectbox(
+        outcome = st.selectbox(
             "Outcome",
-            options=[column for column in OUTCOME_COLUMNS if column in result.outcomes],
-            format_func=lambda name: OUTCOME_CHOICES.get(name, name),
-            key="sensitivity_outcome",
+            options=list(OUTCOME_COLUMNS),
+            format_func=lambda key: OUTCOME_LABELS.get(key, key),
+            key="indiv_outcome",
         )
-        relative_delta = controls[1].slider(
-            "Coefficient change (%)", min_value=5, max_value=50, value=20, step=5
+        st.markdown("**Which preference profiles gained, and which lost**")
+        chart(viz.subgroup_chart(result.subgroups, outcome))
+
+        group_by = st.selectbox(
+            "Group by",
+            options=["archetype", *NUMERIC_PROFILE_COLUMNS],
+            key="group_by",
         )
-        compute = controls[2].button("Compute sensitivity")
+        if group_by != "archetype":
+            from vpe.statistics import subgroup_summary
 
-        if compute:
-            protocol_dict = {
-                key: value
-                for key, value in result.settings["protocol"].items()
-                if key in Protocol.__dataclass_fields__
-            }
-            config_dict = {
-                key: value
-                for key, value in result.settings["model_config"].items()
-                if key in ModelConfig.__dataclass_fields__
-            }
-            with st.spinner("Re-running the model for each coefficient..."):
-                frame = sensitivity_analysis(
-                    profiles=result.profiles,
-                    protocol=Protocol(**protocol_dict),
-                    config=ModelConfig(**config_dict),
-                    seed=result.seed,
-                    outcomes=[sensitivity_outcome],
-                    relative_delta=relative_delta / 100.0,
-                )
-            st.session_state[SENSITIVITY_KEY] = {
-                "fingerprint": result.fingerprint(),
-                "outcome": sensitivity_outcome,
-                "delta": relative_delta,
-                "frame": frame,
-            }
-
-        stored = st.session_state.get(SENSITIVITY_KEY)
-        if stored is None:
-            st.info("Press **Compute sensitivity** to run the one-at-a-time analysis.")
-        elif stored["fingerprint"] != result.fingerprint():
-            st.info("The experiment changed since the last sensitivity run. Press **Compute sensitivity** again.")
+            binned = result.profiles.copy()
+            binned[group_by] = pd.qcut(
+                binned[group_by], q=3, labels=["low", "middle", "high"], duplicates="drop"
+            ).astype(str)
+            table(subgroup_summary(result.paired, binned, by=group_by, outcome=outcome).round(3))
         else:
-            frame = stored["frame"]
-            chart(viz.sensitivity_bars(frame, stored["outcome"]))
-            display = frame.reindex(
-                frame[f"delta_{stored['outcome']}"].abs().sort_values(ascending=False).index
-            )
-            table(display)
-            st.caption(
-                "Largest absolute effects first. A large effect means the model's answer depends "
-                "strongly on a coefficient nobody has validated."
-            )
+            table(result.subgroups.round(3))
+
+        st.markdown("**Example women**")
+        st.caption(
+            "The largest gains and the largest losses under the change. Synthetic individuals, "
+            "shown with the profile variables that drove their response."
+        )
+        merged = result.profiles.merge(
+            result.paired[["woman_id", f"a_{outcome}", f"b_{outcome}", f"diff_{outcome}"]],
+            on="woman_id",
+            how="left",
+        )
+        columns = [
+            "woman_id", "archetype", f"a_{outcome}", f"b_{outcome}", f"diff_{outcome}",
+            "preferred_intensity", "preferred_directness", "warmup_need_min",
+            "overstim_threshold", "comfort_sensitivity",
+        ]
+        st.markdown("_Largest gains_")
+        table(merged.nlargest(5, f"diff_{outcome}")[columns].round(3))
+        st.markdown("_Largest losses_")
+        table(merged.nsmallest(5, f"diff_{outcome}")[columns].round(3))
+
+        with st.expander("Population description"):
+            table(archetypes_frame())
+            table(population_variability(result.profiles))
+            table(population_variables_frame())
 
 # --------------------------------------------------------------------------- #
-# F. Scientific limitations
+# F. Evidence
 # --------------------------------------------------------------------------- #
 
 with tabs[5]:
-    st.subheader("F. Scientific limitations")
-    st.error(SYNTHETIC_DISCLAIMER)
+    st.subheader("F. Evidence")
+    st.write(evidence_summary_text())
 
-    st.markdown("**Four different kinds of uncertainty, kept apart**")
-    table(
-        pd.DataFrame(
-            [
-                {
-                    "kind": "Model output",
-                    "what it is": "A number produced by the equations in vpe/response_model.py for one synthetic couple.",
-                    "status": "Deterministic given inputs, coefficients and noise.",
-                },
-                {
-                    "kind": "Statistical uncertainty (conditional on the model)",
-                    "what it is": "Bootstrap percentile intervals for mean paired differences, plus sampling variation from 1,000 synthetic couples.",
-                    "status": "Describes the simulation only. Not a confidence interval for anything real.",
-                },
-                {
-                    "kind": "Uncertainty from assumptions",
-                    "what it is": "Continuous response coefficients, protocol-effect mapping and the guide-effect parameter are hypothetical.",
-                    "status": "Not quantified. Section E explores some response-model assumptions; the empirical scenario exposes its effect coefficient directly.",
-                },
-                {
-                    "kind": "Real-world empirical evidence",
-                    "what it is": "Measurements from real people under a controlled design.",
-                    "status": "Published aggregate self-report data are included as a reference anchor. There are no human outcome data for this particular guide or its effect.",
-                },
-            ]
+    st.markdown("**Calibration check**")
+    st.write(CALIBRATION_REPORT["statement"])
+    check = calibration_check()
+    table(check["table"])
+    chart(viz.calibration_chart(check["table"]))
+    st.caption(
+        f"Worst deviation: {check['max_deviation_points']} percentage points "
+        f"({'within' if check['within_tolerance'] else 'outside'} the "
+        f"{check['tolerance_points']:.0f}-point tolerance; deviations grow with smaller "
+        f"populations)."
+    )
+    with st.expander("Published category table as reported"):
+        table(reference_distribution_frame())
+
+    st.divider()
+    st.markdown("**Studies used, and what each does and does not support**")
+    studies = studies_frame()
+    for row in studies.to_dict("records"):
+        with st.expander(f"{row['authors']} ({row['year']}) - {row['journal']}"):
+            st.markdown(f"**{row['title']}**")
+            st.markdown(f"DOI: [{row['doi']}](https://doi.org/{row['doi']})")
+            st.markdown(f"*Sample:* {row['sample']}")
+            st.markdown(f"*Findings:* {row['findings']}")
+            st.markdown(f"*Supports:* {row['supports']}")
+            st.markdown(f"*Does not support:* {row['does_not_support']}")
+            st.markdown(f"*Limitations:* {row['limitations']}")
+            st.caption(
+                f"Citation verified against the published record: "
+                f"{'yes' if row['citation_verified'] else 'NO'} ({row['verified_on']})"
+            )
+
+    st.divider()
+    st.markdown("**Evidence status of every parameter**")
+    table(parameter_evidence_frame())
+    chart(
+        viz._style(
+            __import__("plotly.express", fromlist=["px"]).bar(
+                evidence_coverage(), x="evidence_status", y="parameters",
+                color_discrete_sequence=[viz.ACCENT], text="parameters",
+            ).update_traces(marker_line_width=0, textposition="outside").update_layout(
+                xaxis_title="", yaxis_title="Parameters", showlegend=False
+            ),
+            "Where the numbers come from",
+            "Level E is the honest home of every technique effect in this model.",
         )
     )
-
-    st.markdown("**What this simulation cannot establish**")
-    for item in CANNOT_ESTABLISH:
-        st.markdown(f"- {item}")
-
-    st.markdown("**What it can establish**")
-    for item in CAN_ESTABLISH:
-        st.markdown(f"- {item}")
-
-    st.markdown("**Documented assumptions**")
-    for item in KEY_ASSUMPTIONS:
-        st.markdown(f"- {item}")
-
-    st.markdown("**Evidence status of the coefficients**")
-    st.write(EVIDENCE_STATUS_STATEMENT)
-    config_for_limitations = default_config()
-    table(config_for_limitations.evidence_table())
-
-    st.markdown("**Equations used**")
-    st.code(equations_text(config_for_limitations), language="text")
-
-
+    table(parameters_frame(DEFAULT_PARAMETERS))
 
 # --------------------------------------------------------------------------- #
-# G. Research evidence
+# G. Limitations
 # --------------------------------------------------------------------------- #
 
 with tabs[6]:
-    st.subheader("G. Human research anchors")
-    st.success(
-        "This version includes actual published aggregate human-survey percentages. "
-        "The data anchor the starting distribution only; they do not estimate your guide's effect."
-    )
-    st.markdown("**Direct reference: satisfaction with receiving oral sex (cunnilingus)**")
-    primary = RESEARCH_STUDIES[0]
-    st.write(
-        f"{primary['authors']} ({primary['year']}) studied {primary['sample']}. "
-        "The table below reproduces the paper's rounded aggregate response percentages. "
-        "VPE samples synthetic category labels from these percentages; it does not contain the original responses."
-    )
-    table(reference_distribution_table())
-    st.caption(primary["limitations"])
-    st.markdown(f"[Read the published study]({primary['url']}) · DOI: {primary['doi']}")
+    st.subheader("G. What this can and cannot establish")
+    st.error(SYNTHETIC_DISCLAIMER)
+    st.write(evidence_statement())
 
-    st.markdown("**What respondents said affects sexual satisfaction**")
-    st.write(
-        "The same study asked how much different factors affected respondents' sexual satisfaction. "
-        "These are perceived influences, not causal effects and not estimates specific to cunnilingus."
-    )
-    factors = satisfaction_factors_table()
-    chart(viz.satisfaction_factors_chart(factors))
-    table(factors)
+    st.markdown("**Documented limitations**")
+    for item in KEY_LIMITATIONS:
+        st.markdown(f"- {item}")
 
-    st.markdown("**Other research used to shape interpretation**")
-    for study in RESEARCH_STUDIES[1:]:
-        with st.expander(f"{study['authors']} ({study['year']}) - {study['title']}"):
-            st.write(f"**Sample:** {study['sample']}")
-            st.write(f"**Relevance:** {study['relevance']}")
-            st.write(f"**Limitations:** {study['limitations']}")
-            st.write(f"**Use in VPE:** {study['use_in_vpe']}")
-            st.markdown(f"[Open source]({study['url']}) · DOI: {study['doi']}")
+    st.markdown("**Cannot establish**")
+    for item in CANNOT_ESTABLISH:
+        st.markdown(f"- {item}")
 
-    st.warning(
-        "Research anchoring does not turn a hypothetical guide effect into an empirical finding. "
-        "The slider in section A is a what-if assumption. Use zero for the no-effect scenario; "
-        "positive and negative values illustrate sensitivity to that assumption."
-    )
+    st.markdown("**Can establish**")
+    for item in CAN_ESTABLISH:
+        st.markdown(f"- {item}")
 
 st.divider()
 st.caption(
-    "VPE is a research-anchored computational scenario tool. It is not a clinical trial, "
-    "validation or test of real-world effectiveness for the user's guide."
+    "VPE 0.3.0 is an exploration tool for stated assumptions. It must not be described as a "
+    "study, a trial, a validation, or evidence that any technique or guide works."
 )

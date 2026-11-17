@@ -1,12 +1,6 @@
-# Runtime dependencies for the Streamlit app.
-#
-# Bounded ranges keep Streamlit Community Cloud builds reproducible: a bare
-# `>=` floor would let a future major release change behaviour silently.
+# Runtime dependencies. Bounded ranges keep Streamlit Community Cloud builds reproducible.
 streamlit>=1.32,<2
 numpy>=1.26,<3
 pandas>=2.0,<4
 plotly>=5.18,<8
 scipy>=1.11,<2
-
-# scipy is part of the declared project stack (see README section 12). The current
-# runtime code does not import it; remove this line if you want a leaner build.

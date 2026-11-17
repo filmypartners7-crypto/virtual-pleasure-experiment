@@ -1,269 +1,255 @@
-"""Synthetic population generator for the Virtual Pleasure Experiment.
+"""Synthetic population of adult women for VPE 0.3.0.
 
-The generator produces *couples*. Each couple has one synthetic male profile and
-one synthetic female profile, both restricted to adults (18+). Most profile
-characteristics use hypothetical distributions. One ordinal satisfaction category
-is resampled from published aggregate survey percentages; no participant-level
-records are included or reproduced.
+1,000 fictional women by default. Each is generated from a latent preference
+*archetype* plus individual variation, so the population contains genuinely
+different responders rather than one generic profile with noise on top.
 
-Every variable is bounded in [0, 1] except the age category (a label) and the
-relationship duration (years). The distributions are declared in
-:data:`POPULATION_DISTRIBUTIONS` so the dashboard and the README can display them
-next to the data.
+Evidence status: the existence of large preference heterogeneity is
+research-supported (Herbenick et al. 2018). The specific archetypes, their
+weights and their parameter values are a modelling device - they are **not**
+prevalence estimates and no source claims that 22% of women are one type.
+
+Every woman is an adult (18+) by construction.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from .research import sample_reference_profiles
-
-# --------------------------------------------------------------------------- #
-# Age categories - adults only
-# --------------------------------------------------------------------------- #
-
-AGE_CATEGORIES: list[str] = ["18-24", "25-34", "35-44", "45-54", "55-64", "65+"]
-AGE_LOWER_BOUND: dict[str, int] = {
-    "18-24": 18,
-    "25-34": 25,
-    "35-44": 35,
-    "45-54": 45,
-    "55-64": 55,
-    "65+": 65,
-}
-# Hypothetical sampling weights. These are NOT population prevalence claims.
-AGE_CATEGORY_WEIGHTS: list[float] = [0.14, 0.30, 0.24, 0.17, 0.10, 0.05]
-
 MINIMUM_ADULT_AGE = 18
-
-
-# --------------------------------------------------------------------------- #
-# Documented distributions
-# --------------------------------------------------------------------------- #
-
-POPULATION_DISTRIBUTIONS: dict[str, dict[str, Any]] = {
-    "male_age_category": {
-        "group": "male profile",
-        "distribution": "Categorical",
-        "support": ", ".join(AGE_CATEGORIES),
-        "meaning": "Adult age band of the synthetic male partner (18+ only).",
-        "note": "Weights are a demonstration choice, not prevalence data.",
-    },
-    "female_age_category": {
-        "group": "female profile",
-        "distribution": "Categorical",
-        "support": ", ".join(AGE_CATEGORIES),
-        "meaning": "Adult age band of the synthetic female partner (18+ only).",
-        "note": "Weights are a demonstration choice, not prevalence data.",
-    },
-    "male_experience_level": {
-        "group": "male profile",
-        "distribution": "Beta(2.2, 2.2)",
-        "support": "[0, 1]",
-        "meaning": "How much relevant experience the synthetic profile carries.",
-        "note": "Beta parameters are arbitrary and give a broad, symmetric spread.",
-    },
-    "male_communication_responsiveness": {
-        "group": "male profile",
-        "distribution": "Beta(2.6, 2.0)",
-        "support": "[0, 1]",
-        "meaning": "Willingness and ability to respond to a partner's verbal cues.",
-        "note": "Simulated only.",
-    },
-    "male_adherence_variability": {
-        "group": "male profile",
-        "distribution": "Beta(2.0, 3.0)",
-        "support": "[0, 1]",
-        "meaning": "Inconsistency in following a structured approach (higher = less consistent).",
-        "note": "Simulated only. Enters the model as erosion of declared adherence.",
-    },
-    "male_feedback_responsiveness": {
-        "group": "male profile",
-        "distribution": "Beta(2.4, 2.0)",
-        "support": "[0, 1]",
-        "meaning": "Ability to notice and act on partner feedback in the moment.",
-        "note": "Simulated only.",
-    },
-    "female_biological_response_variability": {
-        "group": "female profile",
-        "distribution": "Beta(2.5, 2.5)",
-        "support": "[0, 1]",
-        "meaning": "Individual variability in physiological response tendency.",
-        "note": "A model input only; it is not a clinical measure.",
-    },
-    "female_preference_specificity": {
-        "group": "female profile",
-        "distribution": "Beta(2.2, 2.0)",
-        "support": "[0, 1]",
-        "meaning": "How narrow and specific this profile's preferences are.",
-        "note": "Higher values make adaptation matter more in the model.",
-    },
-    "female_psychological_context": {
-        "group": "female profile",
-        "distribution": "Beta(3.0, 2.0)",
-        "support": "[0, 1]",
-        "meaning": "Contextual / psychological state brought into the scenario (stress, mood, safety).",
-        "note": "A single lumped variable: a simplification of a very complex reality.",
-    },
-    "female_communication_preference": {
-        "group": "female profile",
-        "distribution": "Beta(2.5, 2.2)",
-        "support": "[0, 1]",
-        "meaning": "How readily this profile communicates preferences and limits.",
-        "note": "Interacts with male feedback responsiveness.",
-    },
-    "female_comfort_sensitivity": {
-        "group": "female profile",
-        "distribution": "Beta(2.0, 2.6)",
-        "support": "[0, 1]",
-        "meaning": "How strongly this profile reacts to (in)adequate comfort conditions.",
-        "note": "Enters comfort negatively and discomfort risk positively.",
-    },
-    "relationship_duration_years": {
-        "group": "couple",
-        "distribution": "Log-normal(mean_log=1.6, sd_log=0.7), clipped to [0, 50]",
-        "support": "[0, 50]",
-        "meaning": "Synthetic duration of the couple's relationship, in years.",
-        "note": "Not currently used in the response equations; provided for subgroup exploration.",
-    },
-    "empirical_reference_category": {
-        "group": "female profile (empirical reference anchor)",
-        "distribution": "Categorical resampling of published aggregate percentages",
-        "support": "Not practiced; not satisfactory; somewhat; quite; very satisfactory",
-        "meaning": "Synthetic reproduction of the published category margins for receiving oral sex (cunnilingus).",
-        "note": "Derived from N=1,080 Spanish women aged 18-50 in a voluntary non-probability online sample; not globally representative and not participant-level data.",
-    },
-    "empirical_reference_latent_utility": {
-        "group": "female profile (synthetic ordinal-model variable)",
-        "distribution": "Logistic latent value sampled conditionally within source-derived ordinal category cut-points",
-        "support": "Unbounded real values; NaN for not-practiced category",
-        "meaning": "Mathematical latent value used only to explore a hypothetical ordinal shift scenario.",
-        "note": "Not measured in the published survey. This latent variable is a modelling device, not empirical participant data.",
-    },
+AGE_BANDS: tuple[str, ...] = ("18-24", "25-34", "35-44", "45-54", "55-64", "65+")
+AGE_BAND_WEIGHTS: tuple[float, ...] = (0.16, 0.30, 0.24, 0.16, 0.09, 0.05)
+AGE_BAND_MINIMUM: dict[str, int] = {
+    "18-24": 18, "25-34": 25, "35-44": 35, "45-54": 45, "55-64": 55, "65+": 65,
 }
 
-PROFILE_COLUMNS: list[str] = [
-    "male_experience_level",
-    "male_communication_responsiveness",
-    "male_adherence_variability",
-    "male_feedback_responsiveness",
-    "female_biological_response_variability",
-    "female_preference_specificity",
-    "female_psychological_context",
-    "female_communication_preference",
-    "female_comfort_sensitivity",
-]
 
-BOUNDED_PROFILE_COLUMNS: list[str] = PROFILE_COLUMNS
+@dataclass(frozen=True)
+class Archetype:
+    """A latent responder type. A modelling device, not a taxonomy of real women."""
 
-
-# --------------------------------------------------------------------------- #
-# Generator
-# --------------------------------------------------------------------------- #
+    key: str
+    label: str
+    weight: float
+    preferred_intensity: float
+    preferred_directness: float
+    warmup_need_min: float
+    overstim_threshold: float
+    rhythm_dependence: float
+    comfort_sensitivity: float
+    communication_openness: float
+    description: str
 
 
-def _validate_size(n_couples: int) -> int:
-    if isinstance(n_couples, bool) or not isinstance(n_couples, (int, np.integer)):
+ARCHETYPES: tuple[Archetype, ...] = (
+    Archetype(
+        key="direct_firm",
+        label="Prefers direct and firm",
+        weight=0.22,
+        preferred_intensity=0.72,
+        preferred_directness=0.85,
+        warmup_need_min=2.0,
+        overstim_threshold=0.85,
+        rhythm_dependence=0.50,
+        comfort_sensitivity=0.35,
+        communication_openness=0.60,
+        description="Wants direct glans contact early and higher intensity; tolerates a lot before overstimulation.",
+    ),
+    Archetype(
+        key="indirect_gentle",
+        label="Prefers indirect and gentle",
+        weight=0.20,
+        preferred_intensity=0.42,
+        preferred_directness=0.45,
+        warmup_need_min=4.0,
+        overstim_threshold=0.58,
+        rhythm_dependence=0.60,
+        comfort_sensitivity=0.60,
+        communication_openness=0.55,
+        description="Prefers work through the hood at lower intensity; direct glans contact too early is aversive.",
+    ),
+    Archetype(
+        key="sustained_rhythm",
+        label="Needs sustained rhythm",
+        weight=0.20,
+        preferred_intensity=0.58,
+        preferred_directness=0.65,
+        warmup_need_min=3.0,
+        overstim_threshold=0.75,
+        rhythm_dependence=0.92,
+        comfort_sensitivity=0.45,
+        communication_openness=0.50,
+        description="Moderate preferences but strongly penalised by constant variation; needs one rhythm held.",
+    ),
+    Archetype(
+        key="broad_stimulation",
+        label="Prefers broad, diffuse stimulation",
+        weight=0.18,
+        preferred_intensity=0.55,
+        preferred_directness=0.35,
+        warmup_need_min=5.0,
+        overstim_threshold=0.70,
+        rhythm_dependence=0.50,
+        comfort_sensitivity=0.50,
+        communication_openness=0.50,
+        description="Responds to labial and perineal contact; narrow, pointed stimulation is not what works.",
+    ),
+    Archetype(
+        key="highly_sensitive",
+        label="Highly sensitive",
+        weight=0.20,
+        preferred_intensity=0.32,
+        preferred_directness=0.38,
+        warmup_need_min=6.0,
+        overstim_threshold=0.42,
+        rhythm_dependence=0.70,
+        comfort_sensitivity=0.82,
+        communication_openness=0.65,
+        description="Low overstimulation threshold and a long warm-up need; intensity escalates into discomfort quickly.",
+    ),
+)
+
+ARCHETYPE_INDEX: dict[str, Archetype] = {a.key: a for a in ARCHETYPES}
+
+POPULATION_VARIABLES: dict[str, dict[str, str]] = {
+    "age_band": {"distribution": "Categorical", "meaning": "Adult age band (18+ only)."},
+    "archetype": {"distribution": "Categorical", "meaning": "Latent preference archetype (modelling device)."},
+    "preferred_intensity": {"distribution": "Archetype mean + N(0, 0.08), clipped [0.05, 0.95]", "meaning": "Intensity at which stimulation feels best."},
+    "preferred_directness": {"distribution": "Archetype mean + N(0, 0.10), clipped [0.05, 0.95]", "meaning": "How directly she wants the glans addressed."},
+    "intensity_tolerance": {"distribution": "Beta-derived, 0.12-0.40", "meaning": "Width of the acceptable intensity band."},
+    "warmup_need_min": {"distribution": "Archetype mean + N(0, 1.2) minutes, clipped [0, 12]", "meaning": "Minutes of indirect stimulation before direct contact is comfortable."},
+    "overstim_threshold": {"distribution": "Archetype mean + N(0, 0.08), clipped [0.15, 0.98]", "meaning": "Point where more intensity turns aversive."},
+    "rhythm_dependence": {"distribution": "Archetype mean + N(0, 0.10), clipped [0, 1]", "meaning": "Benefit from a held rhythm."},
+    "comfort_sensitivity": {"distribution": "Archetype mean + N(0, 0.10), clipped [0, 1]", "meaning": "Sensitivity to poor comfort conditions."},
+    "communication_openness": {"distribution": "Archetype mean + N(0, 0.12), clipped [0, 1]", "meaning": "How readily she gives feedback during the encounter."},
+    "experience_level": {"distribution": "Beta(2.2, 2.2)", "meaning": "Prior experience carried into the encounter."},
+    "obligation_sensitivity": {"distribution": "Beta(2.4, 2.0)", "meaning": "How strongly pressure or obligation reduces comfort."},
+}
+
+
+def _validate_size(n: int) -> int:
+    if isinstance(n, bool) or not isinstance(n, (int, np.integer)):
         raise ValueError("population size must be an integer")
-    n_couples = int(n_couples)
-    if n_couples < 2:
-        raise ValueError("population size must be at least 2 couples")
-    if n_couples > 100_000:
-        raise ValueError("population size above 100000 is not supported by this demonstration")
-    return n_couples
+    n = int(n)
+    if n < 2:
+        raise ValueError("population size must be at least 2")
+    if n > 100_000:
+        raise ValueError("population size above 100000 is not supported")
+    return n
 
 
-def _beta(rng: np.random.Generator, n: int, a: float, b: float) -> np.ndarray:
-    """Beta draws, clipped into [0, 1] for numerical safety."""
-    return np.clip(rng.beta(a, b, size=n), 0.0, 1.0)
-
-
-def generate_population(n_couples: int = 1000, seed: int = 42) -> pd.DataFrame:
-    """Generate ``n_couples`` synthetic adult couples.
-
-    Parameters
-    ----------
-    n_couples:
-        Number of couples. Default 1000, as required by the specification.
-    seed:
-        Seed for the reproducible random number generator.
-
-    Returns
-    -------
-    pandas.DataFrame
-        One row per couple. Column ``couple_id`` is a stable identifier used to
-        pair the two experimental conditions.
-    """
-    n = _validate_size(n_couples)
+def generate_population(n_women: int = 1000, seed: int = 42) -> pd.DataFrame:
+    """Generate ``n_women`` synthetic adult women with heterogeneous responders."""
+    n = _validate_size(n_women)
     rng = np.random.default_rng(seed)
+
+    weights = np.array([a.weight for a in ARCHETYPES], dtype=float)
+    weights = weights / weights.sum()
+
+    # Stratified allocation rather than a multinomial draw: each synthetic
+    # population contains the archetype proportions almost exactly, so the
+    # calibration target does not drift with sampling noise in the mix.
+    raw_counts = weights * n
+    counts = np.floor(raw_counts).astype(int)
+    remainder = n - int(counts.sum())
+    if remainder > 0:
+        order = np.argsort(-(raw_counts - counts))
+        for i in range(remainder):
+            counts[order[i % len(counts)]] += 1
+    keys = [a.key for a in ARCHETYPES]
+    archetype_keys = np.array(
+        [key for key, count in zip(keys, counts) for _ in range(int(count))], dtype=object
+    )
+    rng.shuffle(archetype_keys)
+    archetype_keys = archetype_keys.astype(str)
+
+    def per_woman(param: str, sd: float, low: float, high: float) -> np.ndarray:
+        means = np.array([getattr(ARCHETYPE_INDEX[key], param) for key in archetype_keys], dtype=float)
+        return np.clip(means + rng.normal(0.0, sd, size=n), low, high)
 
     frame = pd.DataFrame(
         {
-            "couple_id": [f"C{i:05d}" for i in range(1, n + 1)],
-            "male_age_category": rng.choice(AGE_CATEGORIES, size=n, p=AGE_CATEGORY_WEIGHTS),
-            "female_age_category": rng.choice(AGE_CATEGORIES, size=n, p=AGE_CATEGORY_WEIGHTS),
-            "male_experience_level": _beta(rng, n, 2.2, 2.2),
-            "male_communication_responsiveness": _beta(rng, n, 2.6, 2.0),
-            "male_adherence_variability": _beta(rng, n, 2.0, 3.0),
-            "male_feedback_responsiveness": _beta(rng, n, 2.4, 2.0),
-            "female_biological_response_variability": _beta(rng, n, 2.5, 2.5),
-            "female_preference_specificity": _beta(rng, n, 2.2, 2.0),
-            "female_psychological_context": _beta(rng, n, 3.0, 2.0),
-            "female_communication_preference": _beta(rng, n, 2.5, 2.2),
-            "female_comfort_sensitivity": _beta(rng, n, 2.0, 2.6),
+            "woman_id": [f"W{i:05d}" for i in range(1, n + 1)],
+            "age_band": rng.choice(AGE_BANDS, size=n, p=AGE_BAND_WEIGHTS),
+            "archetype": archetype_keys,
+            "preferred_intensity": per_woman("preferred_intensity", 0.08, 0.05, 0.95),
+            "preferred_directness": per_woman("preferred_directness", 0.10, 0.05, 0.95),
+            "intensity_tolerance": np.clip(rng.beta(3.0, 4.0, size=n) * 0.6 + 0.10, 0.12, 0.40),
+            "warmup_need_min": per_woman("warmup_need_min", 1.2, 0.0, 12.0),
+            "overstim_threshold": per_woman("overstim_threshold", 0.08, 0.15, 0.98),
+            "rhythm_dependence": per_woman("rhythm_dependence", 0.10, 0.0, 1.0),
+            "comfort_sensitivity": per_woman("comfort_sensitivity", 0.10, 0.0, 1.0),
+            "communication_openness": per_woman("communication_openness", 0.12, 0.0, 1.0),
+            "experience_level": np.clip(rng.beta(2.2, 2.2, size=n), 0.0, 1.0),
+            "obligation_sensitivity": np.clip(rng.beta(2.4, 2.0, size=n), 0.0, 1.0),
         }
     )
+    frame["archetype_label"] = frame["archetype"].map(lambda key: ARCHETYPE_INDEX[key].label)
+    frame["age_minimum"] = frame["age_band"].map(AGE_BAND_MINIMUM)
 
-    durations = rng.lognormal(mean=1.6, sigma=0.7, size=n)
-    frame["relationship_duration_years"] = np.clip(durations, 0.0, 50.0)
-
-    # Add a synthetic ordinal response category sampled from published aggregate
-    # percentages. This is not a copy of the original respondents or microdata.
-    reference = sample_reference_profiles(n, rng)
-    frame = pd.concat([frame.reset_index(drop=True), reference], axis=1)
-
-    frame["male_age_minimum"] = frame["male_age_category"].map(AGE_LOWER_BOUND)
-    frame["female_age_minimum"] = frame["female_age_category"].map(AGE_LOWER_BOUND)
-
-    # Hard invariant: nobody in this population is a minor.
-    if frame[["male_age_minimum", "female_age_minimum"]].to_numpy().min() < MINIMUM_ADULT_AGE:
+    if frame["age_minimum"].min() < MINIMUM_ADULT_AGE:
         raise RuntimeError("population generator produced a non-adult profile")
-
     return frame
 
 
+NUMERIC_PROFILE_COLUMNS: tuple[str, ...] = (
+    "preferred_intensity",
+    "preferred_directness",
+    "intensity_tolerance",
+    "warmup_need_min",
+    "overstim_threshold",
+    "rhythm_dependence",
+    "comfort_sensitivity",
+    "communication_openness",
+    "experience_level",
+    "obligation_sensitivity",
+)
+
+
+def archetypes_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "archetype": a.key,
+                "label": a.label,
+                "weight": a.weight,
+                "preferred_intensity": a.preferred_intensity,
+                "preferred_directness": a.preferred_directness,
+                "warmup_need_min": a.warmup_need_min,
+                "overstim_threshold": a.overstim_threshold,
+                "rhythm_dependence": a.rhythm_dependence,
+                "comfort_sensitivity": a.comfort_sensitivity,
+                "description": a.description,
+            }
+            for a in ARCHETYPES
+        ]
+    )
+
+
 def population_variability(profiles: pd.DataFrame) -> pd.DataFrame:
-    """Describe the spread of the bounded profile variables."""
     rows = []
-    for column in BOUNDED_PROFILE_COLUMNS:
+    for column in NUMERIC_PROFILE_COLUMNS:
         values = profiles[column].to_numpy(dtype=float)
         rows.append(
             {
                 "variable": column,
-                "mean": round(float(values.mean()), 4),
-                "sd": round(float(values.std(ddof=1)), 4),
-                "min": round(float(values.min()), 4),
-                "max": round(float(values.max()), 4),
+                "mean": round(float(values.mean()), 3),
+                "sd": round(float(values.std(ddof=1)), 3),
+                "min": round(float(values.min()), 3),
+                "max": round(float(values.max()), 3),
             }
         )
     return pd.DataFrame(rows)
 
 
-def distributions_table() -> pd.DataFrame:
-    """The documented distribution table, for display and export."""
+def population_variables_frame() -> pd.DataFrame:
     return pd.DataFrame(
         [
-            {
-                "variable": name,
-                "profile": spec["group"],
-                "distribution": spec["distribution"],
-                "support": spec["support"],
-                "meaning": spec["meaning"],
-                "note": spec["note"],
-            }
-            for name, spec in POPULATION_DISTRIBUTIONS.items()
+            {"variable": name, "distribution": spec["distribution"], "meaning": spec["meaning"]}
+            for name, spec in POPULATION_VARIABLES.items()
         ]
     )

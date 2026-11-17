@@ -8,6 +8,4 @@ venv/
 *.log
 build/
 dist/
-
-# Never commit local secrets (Streamlit Cloud uses its own secrets manager).
 .streamlit/secrets.toml

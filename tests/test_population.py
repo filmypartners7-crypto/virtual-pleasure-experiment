@@ -1,5 +1,4 @@
-"""Tests for the synthetic population generator."""
-
+"""Synthetic population: 1,000 adults, genuinely heterogeneous, reproducible."""
 from __future__ import annotations
 
 import numpy as np
@@ -7,79 +6,76 @@ import pandas as pd
 import pytest
 
 from vpe.population import (
-    AGE_CATEGORIES,
-    AGE_LOWER_BOUND,
-    BOUNDED_PROFILE_COLUMNS,
+    ARCHETYPES,
     MINIMUM_ADULT_AGE,
+    NUMERIC_PROFILE_COLUMNS,
     generate_population,
     population_variability,
 )
 
 
-def test_default_population_has_exactly_1000_couples() -> None:
+def test_default_population_is_one_thousand_women() -> None:
     profiles = generate_population()
     assert len(profiles) == 1000
-    assert profiles["couple_id"].is_unique
+    assert profiles["woman_id"].is_unique
 
 
-def test_every_participant_is_an_adult() -> None:
+def test_every_woman_is_an_adult() -> None:
     profiles = generate_population(2000, seed=7)
-    assert set(profiles["male_age_category"]).issubset(set(AGE_CATEGORIES))
-    assert set(profiles["female_age_category"]).issubset(set(AGE_CATEGORIES))
-    assert profiles["male_age_minimum"].min() >= MINIMUM_ADULT_AGE
-    assert profiles["female_age_minimum"].min() >= MINIMUM_ADULT_AGE
-    # every declared band really is an adult band
-    assert min(AGE_LOWER_BOUND.values()) >= MINIMUM_ADULT_AGE
+    assert profiles["age_minimum"].min() >= MINIMUM_ADULT_AGE
 
 
-def test_same_seed_reproduces_the_same_population() -> None:
-    first = generate_population(500, seed=123)
-    second = generate_population(500, seed=123)
-    pd.testing.assert_frame_equal(first, second)
+def test_population_contains_multiple_archetypes() -> None:
+    profiles = generate_population(1000, seed=3)
+    counts = profiles["archetype"].value_counts()
+    assert len(counts) == len(ARCHETYPES)
+    assert counts.min() > 40
 
 
-def test_different_seeds_produce_different_populations() -> None:
-    first = generate_population(500, seed=1)
-    second = generate_population(500, seed=2)
-    assert not np.allclose(
-        first["female_comfort_sensitivity"].to_numpy(),
-        second["female_comfort_sensitivity"].to_numpy(),
-    )
-    assert first["couple_id"].tolist() == second["couple_id"].tolist()
-
-
-def test_profile_variables_stay_within_bounds() -> None:
-    profiles = generate_population(1000, seed=99)
-    for column in BOUNDED_PROFILE_COLUMNS:
-        values = profiles[column].to_numpy(dtype=float)
-        assert values.min() >= 0.0, column
-        assert values.max() <= 1.0, column
-    durations = profiles["relationship_duration_years"].to_numpy(dtype=float)
-    assert durations.min() >= 0.0
-    assert durations.max() <= 50.0
-
-
-def test_population_preserves_individual_variation() -> None:
-    profiles = generate_population(1000, seed=5)
+def test_responders_are_not_identical() -> None:
+    profiles = generate_population(1000, seed=4)
+    for column in NUMERIC_PROFILE_COLUMNS:
+        assert profiles[column].std() > 0.01, column
     variability = population_variability(profiles)
-    assert (variability["sd"] > 0.05).all()
-    assert variability["min"].max() < 1.0
-    assert variability["max"].min() > 0.0
+    assert (variability["sd"] > 0.01).all()
 
 
-def test_no_personal_identifiers_are_generated() -> None:
-    profiles = generate_population(200, seed=3)
-    forbidden = {"name", "first_name", "last_name", "email", "phone", "address", "ssn"}
-    assert not forbidden & {column.lower() for column in profiles.columns}
+def test_archetypes_differ_from_each_other() -> None:
+    profiles = generate_population(4000, seed=5)
+    means = profiles.groupby("archetype")["preferred_intensity"].mean()
+    assert means.max() - means.min() > 0.2
 
 
-@pytest.mark.parametrize("bad_size", [0, 1, -5, 100_001])
-def test_invalid_population_sizes_are_rejected(bad_size: int) -> None:
+def test_same_seed_reproduces_the_population() -> None:
+    pd.testing.assert_frame_equal(generate_population(500, seed=11), generate_population(500, seed=11))
+
+
+def test_different_seeds_differ() -> None:
+    a = generate_population(500, seed=1)
+    b = generate_population(500, seed=2)
+    assert not np.allclose(a["preferred_intensity"].to_numpy(), b["preferred_intensity"].to_numpy())
+
+
+def test_parameters_stay_in_range() -> None:
+    profiles = generate_population(1000, seed=9)
+    for column in ("preferred_intensity", "preferred_directness", "overstim_threshold"):
+        assert profiles[column].between(0.0, 1.0).all(), column
+    assert profiles["warmup_need_min"].between(0.0, 12.0).all()
+
+
+def test_no_personal_identifiers() -> None:
+    profiles = generate_population(200, seed=2)
+    forbidden = {"name", "email", "phone", "address", "ssn"}
+    assert not forbidden & {c.lower() for c in profiles.columns}
+
+
+@pytest.mark.parametrize("bad", [0, 1, -4, 100_001])
+def test_invalid_sizes_rejected(bad: int) -> None:
     with pytest.raises(ValueError):
-        generate_population(bad_size)
+        generate_population(bad)
 
 
-@pytest.mark.parametrize("bad_size", [1.5, "1000", None, True])
-def test_non_integer_population_sizes_are_rejected(bad_size: object) -> None:
+@pytest.mark.parametrize("bad", [1.5, "1000", None, True])
+def test_non_integer_sizes_rejected(bad) -> None:
     with pytest.raises(ValueError):
-        generate_population(bad_size)  # type: ignore[arg-type]
+        generate_population(bad)
